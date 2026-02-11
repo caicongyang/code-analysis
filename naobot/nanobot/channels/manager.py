@@ -1,6 +1,33 @@
-"""Channel manager for coordinating chat channels."""
-# 频道管理器模块
-# 用于协调和管理多个聊天频道
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+Channel Manager - 频道管理器模块
+================================================================================
+
+功能描述:
+    管理和协调所有聊天频道，负责频道的初始化、启动、停止和消息路由。
+
+核心功能:
+    1. 频道初始化：根据配置初始化启用的频道
+    2. 启动管理：启动/停止所有频道
+    3. 消息路由：将出站消息分发到对应频道
+
+支持的频道:
+    - Telegram
+    - WhatsApp
+    - Discord
+    - Feishu (飞书)
+    - Mochat
+    - DingTalk (钉钉)
+    - Email
+    - Slack
+    - QQ
+
+消息流:
+    Agent Loop → MessageBus → ChannelManager → Channel → 用户
+
+================================================================================
+"""
 
 from __future__ import annotations
 
@@ -20,39 +47,65 @@ if TYPE_CHECKING:
 
 class ChannelManager:
     """
-    Manages chat channels and coordinates message routing.
-    # 管理聊天频道并协调消息路由
+    ========================================================================
+    ChannelManager - 频道管理器类
+    ========================================================================
     
-    Responsibilities:
-    # 职责：
-    - Initialize enabled channels (Telegram, WhatsApp, etc.)
-    #    初始化启用的频道（Telegram、WhatsApp等）
-    - Start/stop channels
-    #    启动/停止频道
-    - Route outbound messages
-    #    路由出站消息
+    负责管理和协调所有聊天频道。
+    
+    功能特点:
+        1. 动态初始化：根据配置启用/禁用频道
+        2. 统一管理：集中启动、停止所有频道
+        3. 消息路由：自动将消息分发到对应频道
+    
+    生命周期:
+        1. 初始化：根据配置创建频道实例
+        2. start_all(): 启动所有频道
+        3. 运行时：频道独立监听消息
+        4. stop_all(): 停止所有频道
+    
+    ========================================================================
     """
     
-    def __init__(self, config: Config, bus: MessageBus, session_manager: "SessionManager | None" = None):
-        self.config = config
-        # 配置对象
-        self.bus = bus
-        # 消息总线
-        self.session_manager = session_manager
-        # 会话管理器
-        self.channels: dict[str, BaseChannel] = {}
-        # 频道字典
-        self._dispatch_task: asyncio.Task | None = None
-        # 分发任务
+    def __init__(
+        self,
+        config: Config,
+        bus: MessageBus,
+        session_manager: "SessionManager | None" = None
+    ):
+        """
+        初始化频道管理器
         
+        参数说明:
+            config: Config，配置对象
+            bus: MessageBus，消息总线
+            session_manager: SessionManager | None，会话管理器
+        """
+        self.config = config
+        self.bus = bus
+        self.session_manager = session_manager
+        self.channels: dict[str, BaseChannel] = {}
+        self._dispatch_task: asyncio.Task | None = None
+        
+        # 初始化频道
         self._init_channels()
     
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
-        # 根据配置初始化频道
+        """
+        根据配置初始化频道
         
-        # Telegram channel
-        # Telegram频道
+        功能描述:
+            遍历配置中的频道设置，初始化所有启用的频道。
+        
+        处理流程:
+            1. 检查每个频道的 enabled 设置
+            2. 尝试导入频道类
+            3. 创建频道实例并添加到字典
+            4. 如果导入失败，记录警告日志
+        """
+        # ====================================================================
+        # Telegram 频道
+        # ====================================================================
         if self.config.channels.telegram.enabled:
             try:
                 from nanobot.channels.telegram import TelegramChannel
@@ -66,8 +119,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Telegram channel not available: {e}")
         
-        # WhatsApp channel
-        # WhatsApp频道
+        # ====================================================================
+        # WhatsApp 频道
+        # ====================================================================
         if self.config.channels.whatsapp.enabled:
             try:
                 from nanobot.channels.whatsapp import WhatsAppChannel
@@ -78,8 +132,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"WhatsApp channel not available: {e}")
 
-        # Discord channel
-        # Discord频道
+        # ====================================================================
+        # Discord 频道
+        # ====================================================================
         if self.config.channels.discord.enabled:
             try:
                 from nanobot.channels.discord import DiscordChannel
@@ -90,8 +145,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Discord channel not available: {e}")
         
-        # Feishu channel
-        # Feishu频道
+        # ====================================================================
+        # Feishu (飞书) 频道
+        # ====================================================================
         if self.config.channels.feishu.enabled:
             try:
                 from nanobot.channels.feishu import FeishuChannel
@@ -102,12 +158,12 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Feishu channel not available: {e}")
 
-        # Mochat channel
-        # Mochat频道
+        # ====================================================================
+        # Mochat 频道
+        # ====================================================================
         if self.config.channels.mochat.enabled:
             try:
                 from nanobot.channels.mochat import MochatChannel
-
                 self.channels["mochat"] = MochatChannel(
                     self.config.channels.mochat, self.bus
                 )
@@ -115,8 +171,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Mochat channel not available: {e}")
 
-        # DingTalk channel
-        # DingTalk频道
+        # ====================================================================
+        # DingTalk (钉钉) 频道
+        # ====================================================================
         if self.config.channels.dingtalk.enabled:
             try:
                 from nanobot.channels.dingtalk import DingTalkChannel
@@ -127,8 +184,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"DingTalk channel not available: {e}")
 
-        # Email channel
-        # Email频道
+        # ====================================================================
+        # Email 频道
+        # ====================================================================
         if self.config.channels.email.enabled:
             try:
                 from nanobot.channels.email import EmailChannel
@@ -139,8 +197,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Email channel not available: {e}")
 
-        # Slack channel
-        # Slack频道
+        # ====================================================================
+        # Slack 频道
+        # ====================================================================
         if self.config.channels.slack.enabled:
             try:
                 from nanobot.channels.slack import SlackChannel
@@ -151,8 +210,9 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Slack channel not available: {e}")
 
-        # QQ channel
-        # QQ频道
+        # ====================================================================
+        # QQ 频道
+        # ====================================================================
         if self.config.channels.qq.enabled:
             try:
                 from nanobot.channels.qq import QQChannel
@@ -165,41 +225,63 @@ class ChannelManager:
                 logger.warning(f"QQ channel not available: {e}")
     
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
-        """Start a channel and log any exceptions."""
-        # 启动频道并记录任何异常
+        """
+        启动单个频道
+        
+        功能描述:
+            启动频道并处理可能的异常。
+        
+        参数说明:
+            name: str，频道名称
+            channel: BaseChannel，频道实例
+        """
         try:
             await channel.start()
         except Exception as e:
             logger.error(f"Failed to start channel {name}: {e}")
 
     async def start_all(self) -> None:
-        """Start all channels and the outbound dispatcher."""
-        # 启动所有频道和出站分发器
+        """
+        启动所有频道和出站分发器
+        
+        功能描述:
+            启动所有已启用的频道和消息分发器。
+        
+        处理流程:
+            1. 如果没有启用的频道，记录警告
+            2. 启动出站消息分发器
+            3. 并发启动所有频道
+            4. 等待所有频道运行
+        """
         if not self.channels:
             logger.warning("No channels enabled")
             return
         
-        # Start outbound dispatcher
         # 启动出站分发器
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
         
-        # Start channels
-        # 启动频道
+        # 启动所有频道
         tasks = []
         for name, channel in self.channels.items():
             logger.info(f"Starting {name} channel...")
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
         
-        # Wait for all to complete (they should run forever)
-        # 等待所有完成（它们应该永远运行）
+        # 等待所有频道启动（它们应该永远运行）
         await asyncio.gather(*tasks, return_exceptions=True)
     
     async def stop_all(self) -> None:
-        """Stop all channels and the dispatcher."""
-        # 停止所有频道和分发器
+        """
+        停止所有频道和分发器
+        
+        功能描述:
+            优雅地停止所有频道和消息分发器。
+        
+        处理流程:
+            1. 停止出站分发器
+            2. 停止所有频道
+        """
         logger.info("Stopping all channels...")
         
-        # Stop dispatcher
         # 停止分发器
         if self._dispatch_task:
             self._dispatch_task.cancel()
@@ -208,7 +290,6 @@ class ChannelManager:
             except asyncio.CancelledError:
                 pass
         
-        # Stop all channels
         # 停止所有频道
         for name, channel in self.channels.items():
             try:
@@ -218,17 +299,29 @@ class ChannelManager:
                 logger.error(f"Error stopping {name}: {e}")
     
     async def _dispatch_outbound(self) -> None:
-        """Dispatch outbound messages to the appropriate channel."""
-        # 将出站消息分发到适当的频道
+        """
+        分发出站消息到对应频道
+        
+        功能描述:
+            从消息总线获取出站消息，分发到对应的频道。
+        
+        处理流程:
+            1. 从消息总线获取出站消息（超时 1 秒）
+            2. 查找对应的频道
+            3. 调用频道的 send() 方法发送
+            4. 处理异常
+        """
         logger.info("Outbound dispatcher started")
         
         while True:
             try:
+                # 获取出站消息
                 msg = await asyncio.wait_for(
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
                 
+                # 查找频道
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
@@ -244,13 +337,24 @@ class ChannelManager:
                 break
     
     def get_channel(self, name: str) -> BaseChannel | None:
-        """Get a channel by name."""
-        # 根据名称获取频道
+        """
+        根据名称获取频道
+        
+        参数说明:
+            name: str，频道名称
+        
+        返回值:
+            BaseChannel | None，频道实例或 None
+        """
         return self.channels.get(name)
     
     def get_status(self) -> dict[str, Any]:
-        """Get status of all channels."""
-        # 获取所有频道的状态
+        """
+        获取所有频道的状态
+        
+        返回值:
+            dict，频道状态字典
+        """
         return {
             name: {
                 "enabled": True,
@@ -261,6 +365,10 @@ class ChannelManager:
     
     @property
     def enabled_channels(self) -> list[str]:
-        """Get list of enabled channel names."""
-        # 获取启用的频道名称列表
+        """
+        获取已启用的频道名称列表
+        
+        返回值:
+            list[str]，频道名称列表
+        """
         return list(self.channels.keys())
