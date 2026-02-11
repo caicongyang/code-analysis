@@ -1,0 +1,561 @@
+"""
+AI trading strategy trigger management with simplified logic.
+"""
+"""
+AI交易策略触发管理系统（简化逻辑版本）
+
+该模块是Hyper Alpha Arena交易平台的核心策略引擎，负责：
+- AI交易策略的生命周期管理
+- 多种触发机制的统一调度（信号触发 + 定时触发）
+- 策略状态的实时同步和管理
+- 与Hyperliquid交易所的集成
+
+主要功能：
+1. 策略触发管理：支持信号池触发和定时触发两种模式
+2. 动态策略加载：实时检测策略配置变更并同步
+3. 多账户支持：并行管理多个交易账户的策略
+4. 风险控制：集成采样池和信号分析系统
+5. 交易执行：自动下单和风险管理
+
+架构特点：
+- 事件驱动：基于市场信号和时间事件的异步处理
+- 高可用性：支持策略的热重载和故障恢复
+- 模块化设计：与信号检测、订单执行等模块解耦
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, Optional, Any, List
+
+from database.connection import SessionLocal
+from database.models import Account, AccountStrategyConfig, GlobalSamplingConfig
+from sqlalchemy import text
+from repositories.strategy_repo import (
+    get_strategy_by_account,
+    list_strategies,
+    upsert_strategy,
+)
+from services.sampling_pool import sampling_pool
+from services.trading_commands import (
+    place_ai_driven_crypto_order,
+    place_ai_driven_hyperliquid_order,
+)
+from services.hyperliquid_symbol_service import get_selected_symbols as get_hyperliquid_selected_symbols
+
+logger = logging.getLogger(__name__)
+
+STRATEGY_REFRESH_INTERVAL = 60.0  # seconds
+# 策略刷新间隔时间（秒）
+# 系统每60秒检查一次策略配置变更，包括：
+# - 新增或删除的策略
+# - 策略参数的修改（触发间隔、信号池绑定等）
+# - 策略启用/禁用状态变化
+# 这确保了策略配置的实时生效，而不需要重启服务
+
+
+def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Ensure stored timestamps are timezone-aware UTC."""
+    """
+    时间戳时区处理函数
+
+    确保数据库存储的时间戳都带有时区信息并转换为UTC时间。
+    这对于全球化交易系统至关重要，避免时区混乱导致的交易错误。
+
+    Args:
+        dt: 可能带有或不带有时区信息的datetime对象
+
+    Returns:
+        带有UTC时区信息的datetime对象，或None
+
+    处理逻辑：
+    1. None值直接返回None
+    2. 无时区信息的时间戳：假设为本地时区，然后转换为UTC
+    3. 有时区信息的时间戳：直接转换为UTC
+
+    重要性：
+    - 避免夏令时导致的时间偏移
+    - 确保多地区用户看到一致的时间
+    - 简化时间计算和比较逻辑
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # 无时区信息，假设为本地时区
+        local_tz = datetime.now().astimezone().tzinfo
+        return dt.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)  # 转换为UTC时间
+
+
+@dataclass
+class StrategyState:
+    """
+    策略状态数据类
+
+    封装单个AI交易策略的完整状态信息，用于策略管理器的内存缓存。
+    该类设计为轻量级，支持快速查询和状态比较。
+
+    字段详解：
+    - account_id: 关联的交易账户ID，每个账户可配置独立的交易策略
+    - price_threshold: 价格阈值（已弃用），为兼容性保留，建议使用信号池
+    - trigger_interval: 触发间隔（秒），定时触发的时间间隔，作为信号触发的备用机制
+    - signal_pool_ids: 信号池ID列表，定义触发该策略的市场信号组合（OR关系）
+    - enabled: 策略启用状态，false时策略将被暂停
+
+    触发机制说明：
+    1. 信号触发（主要）：当任一绑定信号池触发时立即执行策略
+    2. 定时触发（备用）：在无信号触发时按固定间隔检查交易条件
+    3. 两种机制并存，确保策略在各种市场条件下都能正常工作
+
+    使用场景：
+    - 策略管理器的内存状态同步
+    - 策略配置变更检测
+    - 多策略并行执行管理
+    """
+    account_id: int                    # 交易账户ID
+    price_threshold: float             # 价格阈值（已弃用，兼容性保留）
+    trigger_interval: int              # 定时触发间隔（秒）
+    signal_pool_ids: List[int]         # 信号池ID列表（OR关系）
+    enabled: bool                      # 策略启用状态
+    scheduled_trigger_enabled: bool  # Enable/disable scheduled trigger
+    last_trigger_at: Optional[datetime]
+    running: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    # Backward compatibility property
+    @property
+    def signal_pool_id(self) -> Optional[int]:
+        return self.signal_pool_ids[0] if self.signal_pool_ids else None
+
+    def should_trigger_scheduled(self, event_time: datetime) -> bool:
+        """Check if strategy should trigger based on scheduled time interval (fallback)"""
+        if not self.enabled:
+            return False
+
+        # Check if scheduled trigger is disabled
+        if not self.scheduled_trigger_enabled:
+            return False
+
+        # Quick check without lock to avoid unnecessary contention
+        if self.running:
+            return False
+
+        with self.lock:
+            # Double-check after acquiring lock
+            if self.running:
+                return False
+
+            now_ts = event_time.timestamp()
+            last_ts = self.last_trigger_at.timestamp() if self.last_trigger_at else 0
+            time_diff = now_ts - last_ts
+
+            # Check time interval trigger (scheduled fallback)
+            if time_diff >= self.trigger_interval:
+                self.last_trigger_at = event_time
+                self.running = True
+                logger.info(
+                    f"Strategy scheduled trigger for account {self.account_id}: "
+                    f"Time interval ({time_diff:.1f}s / {self.trigger_interval}s)"
+                )
+                return True
+
+            return False
+
+    def mark_triggered_by_signal(self, event_time: datetime) -> bool:
+        """Mark strategy as triggered by signal (called from signal callback)"""
+        if not self.enabled:
+            return False
+
+        with self.lock:
+            if self.running:
+                return False
+            self.last_trigger_at = event_time
+            self.running = True
+            return True
+
+
+class StrategyManager:
+    def __init__(self):
+        self.strategies: Dict[int, StrategyState] = {}
+        self.lock = threading.Lock()
+        self.running = False
+        self.refresh_thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the strategy manager"""
+        with self.lock:
+            if self.running:
+                logger.warning("Strategy manager already running")
+                return
+
+            self.running = True
+            self._load_strategies()
+
+            # Start refresh thread
+            self.refresh_thread = threading.Thread(
+                target=self._refresh_strategies_loop,
+                daemon=True
+            )
+            self.refresh_thread.start()
+
+            logger.info("Strategy manager started")
+
+    def stop(self):
+        """Stop the strategy manager"""
+        with self.lock:
+            if not self.running:
+                return
+
+            self.running = False
+
+        if self.refresh_thread:
+            self.refresh_thread.join(timeout=5.0)
+
+        logger.info("Strategy manager stopped")
+
+    def _load_strategies(self):
+        """Load strategies from database"""
+        from repositories.strategy_repo import parse_signal_pool_ids
+
+        try:
+            # PostgreSQL handles concurrent access natively
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(AccountStrategyConfig, Account)
+                    .join(Account, AccountStrategyConfig.account_id == Account.id)
+                    .all()
+                )
+
+                self.strategies.clear()
+                for strategy, account in rows:
+                    pool_ids = parse_signal_pool_ids(strategy)
+                    state = StrategyState(
+                        account_id=strategy.account_id,
+                        price_threshold=strategy.price_threshold,
+                        trigger_interval=strategy.trigger_interval,
+                        signal_pool_ids=pool_ids,
+                        enabled=strategy.enabled == "true",
+                        scheduled_trigger_enabled=strategy.scheduled_trigger_enabled,
+                        last_trigger_at=_as_aware(strategy.last_trigger_at),
+                    )
+                    self.strategies[strategy.account_id] = state
+
+                    # DEBUG: Print loaded strategy configuration
+                    print(
+                        f"[DEBUG] Loaded strategy for account {strategy.account_id} ({account.name}): "
+                        f"interval={strategy.trigger_interval}s ({strategy.trigger_interval/60:.1f}min), "
+                        f"signal_pool_ids={pool_ids}, enabled={strategy.enabled}, "
+                        f"scheduled_trigger={strategy.scheduled_trigger_enabled}, "
+                        f"last_trigger={state.last_trigger_at}"
+                    )
+
+                logger.info(f"Loaded {len(self.strategies)} strategies")
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"Failed to load strategies: {e}")
+            # Don't retry immediately on database lock
+            if "database is locked" in str(e):
+                logger.warning("Database locked, skipping strategy refresh")
+
+    def _refresh_strategies_loop(self):
+        """Periodically refresh strategies from database"""
+        while self.running:
+            try:
+                time.sleep(STRATEGY_REFRESH_INTERVAL)
+                if self.running:
+                    self._load_strategies()
+            except Exception as e:
+                logger.error(f"Error in strategy refresh loop: {e}")
+
+    def handle_price_update(self, symbol: str, price: float, event_time: datetime):
+        """Handle price update and check for scheduled strategy triggers (fallback)"""
+        try:
+            # Add to sampling pool if needed
+            with SessionLocal() as db:
+                global_config = db.query(GlobalSamplingConfig).first()
+                sampling_interval = global_config.sampling_interval if global_config else 18
+
+            if sampling_pool.should_sample(symbol, sampling_interval):
+                sampling_pool.add_sample(symbol, price, event_time.timestamp())
+
+            # Check each strategy for scheduled triggers (fallback mechanism)
+            # Signal-based triggers are handled via callback from signal_detection_service
+            for account_id, state in self.strategies.items():
+                if state.should_trigger_scheduled(event_time):
+                    # Build trigger context for scheduled triggers
+                    scheduled_trigger_context = {
+                        "trigger_type": "scheduled",
+                        "trigger_interval": state.trigger_interval,
+                    }
+                    self._execute_strategy(
+                        account_id, symbol, event_time,
+                        trigger_type="scheduled",
+                        trigger_context=scheduled_trigger_context
+                    )
+
+        except Exception as e:
+            logger.error(f"Error handling price update for {symbol}: {e}")
+            print(f"Error in strategy manager: {e}")
+
+    def _execute_strategy(
+        self,
+        account_id: int,
+        symbol: str,
+        event_time: datetime,
+        trigger_type: str = "scheduled",
+        trigger_context: Optional[Dict[str, Any]] = None
+    ):
+        """Execute strategy for account with trigger context"""
+        state = self.strategies.get(account_id)
+        if not state:
+            return
+
+        # Note: running state and timestamp already set in should_trigger or mark_triggered_by_signal
+        try:
+            # Immediately persist timestamp to database (before AI call)
+            with SessionLocal() as db:
+                from database.models import AccountStrategyConfig
+                strategy = db.query(AccountStrategyConfig).filter_by(account_id=account_id).first()
+                if strategy:
+                    strategy.last_trigger_at = event_time
+                    db.commit()
+                    logger.info(
+                        f"Strategy execution started for account {account_id} (trigger: {trigger_type}), "
+                        f"next scheduled trigger in {strategy.trigger_interval}s ({strategy.trigger_interval/60:.1f}min)"
+                    )
+
+            # Check account configuration
+            with SessionLocal() as db:
+                account = db.query(Account).filter(Account.id == account_id).first()
+                if not account or account.auto_trading_enabled != "true":
+                    logger.debug(f"Account {account_id} auto trading disabled, skipping strategy execution")
+                    return
+
+            # Execute AI trading decision with trigger context
+            logger.info(f"Account {account_id} executing Hyperliquid trading (trigger: {trigger_type})")
+            from services.trading_commands import place_ai_driven_hyperliquid_order
+            place_ai_driven_hyperliquid_order(account_id=account_id, trigger_context=trigger_context)
+
+        except Exception as e:
+            logger.error(f"Error executing strategy for account {account_id}: {e}")
+        finally:
+            # Always reset running state
+            state.running = False
+
+    def get_strategy_status(self) -> Dict[str, Any]:
+        """Get status of all strategies"""
+        status = {
+            "running": self.running,
+            "strategy_count": len(self.strategies),
+            "strategies": {}
+        }
+
+        for account_id, state in self.strategies.items():
+            status["strategies"][account_id] = {
+                "enabled": state.enabled,
+                "running": state.running,
+                "price_threshold": state.price_threshold,
+                "trigger_interval": state.trigger_interval,
+                "last_trigger_at": state.last_trigger_at.isoformat() if state.last_trigger_at else None
+            }
+
+        return status
+
+
+# Hyperliquid-only strategy manager with signal pool support
+class HyperliquidStrategyManager(StrategyManager):
+    def __init__(self):
+        super().__init__()
+        self._signal_callback_registered = False
+
+    def start(self):
+        """Start the strategy manager and register signal callback"""
+        super().start()
+        self._register_signal_callback()
+
+    def stop(self):
+        """Stop the strategy manager and unregister signal callback"""
+        self._unregister_signal_callback()
+        super().stop()
+
+    def _register_signal_callback(self):
+        """Register callback with signal detection service"""
+        logger.warning("[HyperliquidStrategy] _register_signal_callback() called")
+        if self._signal_callback_registered:
+            logger.warning("[HyperliquidStrategy] Callback already registered, skipping")
+            return
+        try:
+            from services.signal_detection_service import signal_detection_service
+            logger.warning(f"[HyperliquidStrategy] Callbacks before register: {len(signal_detection_service._trigger_callbacks)}")
+            signal_detection_service.subscribe_signal_triggers(self._on_signal_triggered)
+            self._signal_callback_registered = True
+            logger.warning(f"[HyperliquidStrategy] Signal trigger callback registered! Callbacks after: {len(signal_detection_service._trigger_callbacks)}")
+        except Exception as e:
+            logger.error(f"[HyperliquidStrategy] Failed to register signal callback: {e}", exc_info=True)
+
+    def _unregister_signal_callback(self):
+        """Unregister callback from signal detection service"""
+        if not self._signal_callback_registered:
+            return
+        try:
+            from services.signal_detection_service import signal_detection_service
+            signal_detection_service.unsubscribe_signal_triggers(self._on_signal_triggered)
+            self._signal_callback_registered = False
+            logger.info("[HyperliquidStrategy] Signal trigger callback unregistered")
+        except Exception as e:
+            logger.error(f"[HyperliquidStrategy] Failed to unregister signal callback: {e}")
+
+    def _on_signal_triggered(self, symbol: str, pool: dict, market_data: dict, triggered_signals: list):
+        """Callback when a signal pool triggers - find and execute bound strategies"""
+        pool_id = pool.get("pool_id")  # Fixed: key is "pool_id" not "id"
+        pool_name = pool.get("pool_name", "Unknown")
+        event_time = datetime.now(timezone.utc)
+
+        print(f"[HyperliquidStrategy] Signal pool triggered: {pool_name} (pool_id={pool_id}) on {symbol}")
+        print(f"[HyperliquidStrategy] Checking {len(self.strategies)} strategies for pool_id={pool_id}")
+
+        # Also trigger Program Trader execution
+        try:
+            from services.program_execution_service import program_execution_service
+            program_execution_service.on_signal_triggered(symbol, pool, market_data, triggered_signals)
+        except Exception as e:
+            logger.error(f"[HyperliquidStrategy] Failed to trigger program execution: {e}")
+
+        # Find all strategies bound to this signal pool (check if pool_id in signal_pool_ids)
+        found_match = False
+        for account_id, state in self.strategies.items():
+            print(f"[HyperliquidStrategy] Account {account_id}: signal_pool_ids={state.signal_pool_ids}, enabled={state.enabled}")
+            if pool_id in state.signal_pool_ids:
+                found_match = True
+                # Try to mark as triggered (handles running state check)
+                if state.mark_triggered_by_signal(event_time):
+                    # Build trigger context for AI prompt
+                    trigger_context = {
+                        "trigger_type": "signal",
+                        "signal_pool_id": pool_id,
+                        "signal_pool_name": pool_name,
+                        "pool_logic": pool.get("logic", "OR"),
+                        "triggered_signals": triggered_signals,
+                        "trigger_symbol": symbol,
+                        "market_data_snapshot": market_data,
+                        "signal_trigger_id": pool.get("trigger_log_id"),  # For decision tracking
+                    }
+                    print(f"[HyperliquidStrategy] Executing strategy for account {account_id} (signal pool: {pool_name})")
+                    self._execute_strategy(
+                        account_id, symbol, event_time,
+                        trigger_type="signal", trigger_context=trigger_context
+                    )
+                else:
+                    print(f"[HyperliquidStrategy] Account {account_id} mark_triggered_by_signal returned False (already running?)")
+
+        if not found_match:
+            print(f"[HyperliquidStrategy] No strategy found bound to pool_id={pool_id}")
+
+    def _load_strategies(self):
+        """Load only Hyperliquid-enabled strategies from database"""
+        from repositories.strategy_repo import parse_signal_pool_ids
+
+        try:
+            db = SessionLocal()
+            try:
+                rows = (
+                    db.query(AccountStrategyConfig, Account)
+                    .join(Account, AccountStrategyConfig.account_id == Account.id)
+                    .all()
+                )
+
+                self.strategies.clear()
+                for strategy, account in rows:
+                    pool_ids = parse_signal_pool_ids(strategy)
+                    state = StrategyState(
+                        account_id=strategy.account_id,
+                        price_threshold=strategy.price_threshold,
+                        trigger_interval=strategy.trigger_interval,
+                        signal_pool_ids=pool_ids,
+                        enabled=strategy.enabled == "true",
+                        scheduled_trigger_enabled=strategy.scheduled_trigger_enabled,
+                        last_trigger_at=_as_aware(strategy.last_trigger_at),
+                    )
+                    self.strategies[strategy.account_id] = state
+
+                    print(
+                        f"[HyperliquidStrategy DEBUG] Loaded strategy for account {strategy.account_id} ({account.name}): "
+                        f"interval={strategy.trigger_interval}s ({strategy.trigger_interval/60:.1f}min), "
+                        f"signal_pool_ids={pool_ids}, enabled={strategy.enabled}, "
+                        f"scheduled_trigger={strategy.scheduled_trigger_enabled}, "
+                        f"last_trigger={state.last_trigger_at}"
+                    )
+
+                logger.info(f"[HyperliquidStrategy] Loaded {len(self.strategies)} strategies")
+            finally:
+                db.close()
+
+        except Exception as e:
+            logger.error(f"[HyperliquidStrategy] Failed to load strategies: {e}")
+            if "database is locked" in str(e):
+                logger.warning("[HyperliquidStrategy] Database locked, skipping strategy refresh")
+
+
+# Global strategy manager instance (Hyperliquid only)
+hyper_strategy_manager = HyperliquidStrategyManager()
+
+
+def start_strategy_manager():
+    """Start the global strategy manager"""
+    hyper_strategy_manager.start()
+
+
+def stop_strategy_manager():
+    """Stop the global strategy manager"""
+    hyper_strategy_manager.stop()
+
+
+def handle_price_update(symbol: str, price: float, event_time: Optional[datetime] = None):
+    """Handle price update from market data"""
+    if event_time is None:
+        event_time = datetime.now(timezone.utc)
+
+
+    # Use Hyperliquid strategy manager only
+    hyper_strategy_manager.handle_price_update(symbol, price, event_time)
+
+
+def _execute_strategy_direct(account_id: int, symbol: str, event_time: datetime, db, is_hyper: bool = False):
+    """Execute strategy directly without going through StrategyManager"""
+    try:
+        from database.models import AccountStrategyConfig
+
+        # Update last trigger time
+        strategy = db.query(AccountStrategyConfig).filter_by(account_id=account_id).first()
+        if strategy:
+            strategy.last_trigger_at = event_time
+            db.commit()
+
+        # Execute the trade
+        if is_hyper:
+            logger.info(f"[DirectStrategy] Executing Hyperliquid trade for account {account_id}")
+            place_ai_driven_hyperliquid_order(account_id=account_id)
+        else:
+            from services.auto_trader import place_ai_driven_crypto_order
+            place_ai_driven_crypto_order(max_ratio=0.2, account_id=account_id)
+        logger.info(f"Strategy executed for account {account_id} on {symbol} price update")
+
+    except Exception as e:
+        logger.error(f"Failed to execute strategy for account {account_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def get_strategy_status() -> Dict[str, Any]:
+    """Get strategy manager status"""
+    status = {
+        "hyperliquid": hyper_strategy_manager.get_strategy_status(),
+    }
+    return status
